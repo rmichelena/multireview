@@ -1,6 +1,6 @@
 ---
 name: multireview
-description: Run consolidated multi-model code reviews on GitHub repositories. Supports two variants: PR reviews posted back to GitHub as a summary plus inline comments, and non-PR scope reviews delivered as a consolidated Markdown file in the repo. Use when asked for multi-review, PR review, code review with multiple models, fresh eyes, review a folder/subtree, or publish a review document.
+description: "Run consolidated multi-model code reviews on GitHub repositories. Supports two variants: PR reviews posted back to GitHub as a summary plus inline comments, and non-PR scope reviews delivered as a consolidated Markdown file in the repo. Use when asked for multi-review, PR review, code review with multiple models, fresh eyes, review a folder/subtree, or publish a review document."
 ---
 
 # Multi-Review (Consolidated Reviewers)
