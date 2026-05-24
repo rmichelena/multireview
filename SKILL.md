@@ -108,15 +108,49 @@ DO NOT review security/hardening. Explicitly ignore security/privacy/vulnerabili
 2. Fetch PR metadata:
 
 ```bash
-gh pr view <N> --repo <owner/repo> --json title,headRefName,headRefOid,additions,deletions,changedFiles \
-  -q '{branch: .headRefName, commit: .headRefOid, additions: .additions, deletions: .deletions, files: .changedFiles, title: .title}'
+gh pr view <N> --repo <owner/repo> --json title,headRefName,headRefOid,baseRefName,baseRefOid,additions,deletions,changedFiles,files \
+  -q '{branch: .headRefName, base: .baseRefName, baseCommit: .baseRefOid, commit: .headRefOid, additions: .additions, deletions: .deletions, files: [.files[].path], changedFiles: .changedFiles, title: .title}'
 ```
 
-3. Spawn reviewer subagents with the PR task.
-4. Wait for completion events. Do not poll in loops.
-5. Consolidate findings.
-6. Post one PR summary comment and inline comments where useful.
-7. Report concise result to the user.
+3. Prepare one shared local PR review snapshot before spawning reviewers:
+   - `base/` checkout at the PR base commit or base branch tip
+   - `head/` checkout at the PR head commit
+   - `PR_DIFF.patch` from `gh pr diff`
+   - `PR_METADATA.json` with branch, base, commit, changed files, stats
+4. Tell subagents to use the local snapshot and **not** clone/fetch unless explicitly necessary.
+5. Spawn reviewer subagents with the PR task.
+6. Wait for completion events. Do not poll in loops.
+7. Consolidate findings.
+8. Post one PR summary comment and inline comments where useful.
+9. Report concise result to the user.
+
+### PR local snapshot pattern
+
+Prepare a shared snapshot once, then pass these paths to all reviewers:
+
+```bash
+BASE=/tmp/<repo>-pr<N>-review
+rm -rf "$BASE"
+mkdir -p "$BASE"
+
+gh repo clone <owner>/<repo> "$BASE/head" -- --no-checkout
+cd "$BASE/head"
+git fetch origin <base_branch> <head_branch> --prune
+git checkout <head_commit_sha>
+
+cd "$BASE"
+git clone --no-checkout "$BASE/head" base
+cd "$BASE/base"
+git checkout <base_commit_sha>  # or origin/<base_branch> if baseRefOid is unavailable
+
+cd "$BASE"
+gh pr diff <N> --repo <owner>/<repo> > PR_DIFF.patch
+cat > PR_METADATA.json <<JSON
+{"repo":"<owner>/<repo>","pr":<N>,"base":"<base_branch>","branch":"<head_branch>","baseCommit":"<base_commit_sha>","commit":"<head_commit_sha>","changedFiles":<count>}
+JSON
+```
+
+The `base/` checkout is for regression comparisons. The `head/` checkout is the PR code as reviewed. `PR_DIFF.patch` identifies the changed hunks.
 
 ### PR reviewer task template
 
@@ -128,13 +162,26 @@ IMPORTANT CONTEXT:
 - Repo: {owner}/{repo}
 - PR: #{pr_number}
 - Branch: {branch}
+- Base: {base_branch}
 - Head commit SHA: {commit_sha}
+- Base commit SHA: {base_commit_sha}
 - {stats_summary}
-- Use this commit SHA for line references.
+- Use the head commit SHA for line references.
+
+Local review snapshot prepared by the orchestrator:
+- Head snapshot: {snapshot_root}/head
+- Base snapshot: {snapshot_root}/base
+- Diff patch: {snapshot_root}/PR_DIFF.patch
+- Metadata: {snapshot_root}/PR_METADATA.json
+
+Do NOT clone or fetch the repo. Use the local snapshots and diff above.
+For changed code, read files under `head/`.
+For regression comparisons, compare against `base/`.
+Use `PR_DIFF.patch` to identify changed files and line context.
 
 Steps:
-1. Run: gh pr diff {pr_number} --repo {owner}/{repo}
-2. Read files referenced in the diff for full context.
+1. Read `PR_DIFF.patch` to understand the changed hunks.
+2. Read changed files from `head/` and, when needed, compare to `base/`.
 3. Analyze for the requested categories.
 4. Apply the reviewer discipline rules from this skill: read surrounding context, avoid duplicates, use concrete traces for logic claims, and keep only high-signal findings.
 5. Return findings in the exact ===FINDING=== format.

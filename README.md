@@ -32,6 +32,20 @@ The skill documents a five-reviewer setup:
 
 The orchestrator is GPT-5.5 in the tested setup, but the method is agent-agnostic.
 
+
+## Why multi-model review?
+
+Different models have different failure modes, strengths, and blind spots. Running several independent reviewers increases the chance that at least one model catches a real bug that others miss.
+
+The orchestrator then consolidates the results. Findings reported by multiple models carry more confidence because independent reviewers converged on the same issue. Single-model findings are still useful, but they are filtered more aggressively for evidence, traces, and false positives.
+
+In practice, this gives two benefits:
+
+- **Broader bug discovery:** diversity catches more edge cases.
+- **Stronger signal:** consensus makes important findings easier to trust and prioritize.
+
+The goal is not to produce five separate reviews; it is to produce one high-signal review backed by independent analysis.
+
 ## Core ideas
 
 - Reviewers are **analysis-only**; they do not post to GitHub or edit files.
