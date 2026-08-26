@@ -54,7 +54,7 @@ Subagent responses can truncate on long reviews. To prevent data loss, **every s
    - Workspace alternative (if running under a filesystem sandbox): `~/.openclaw/workspace/tmp/<scope>-pr<N>-review/`
    - Keeping everything in one directory makes each review round self-contained and auditable.
 2. Before spawning each subagent, the orchestrator assigns an output file path inside that same directory:
-   - `<review-dir>/findings-gpt55.md`
+   - `<review-dir>/findings-terra.md`
    - `<review-dir>/findings-glm.md`
    - `<review-dir>/findings-qwen.md`
 3. The subagent task includes `OUTPUT_FILE: <path>` as a prominent instruction.
@@ -373,7 +373,7 @@ After writing, reply with ONLY: "DONE: wrote N findings to {output_file}"
 If you found no issues, write an empty file and reply: "DONE: 0 findings, empty file written."
 
 Review target: {owner}/{repo}, branch {branch}, commit {commit_sha}.
-Scope: {scope_description}. Local snapshot: {snapshot_path} (findings still go to the workspace path above)
+Scope: {scope_description}. Local snapshot: {snapshot_path} (findings still go to the review directory above)
 Adjacent context included: {context_files_or_dirs}
 
 USER REQUEST: {brief review theme}. {security_exclusion_if_any}
@@ -434,7 +434,7 @@ Use `sessions_spawn` once per reviewer. Parallel spawning is fine. Each reviewer
   "runTimeoutSeconds": 900,
   "cleanup": "keep",
   "label": "<scope>-review-terra",
-  "task": "<reviewer task with OUTPUT_FILE: ~/.openclaw/workspace/.openclaw/tmp/<scope>-pr<N>-review/findings-terra.md>"
+  "task": "<reviewer task with OUTPUT_FILE: <review-dir>/findings-terra.md>"
 }
 ```
 
@@ -443,10 +443,10 @@ Label pattern:
 - `<scope>-review-glm`
 - `<scope>-review-qwen`
 
-Output file pattern:
-- `~/.openclaw/workspace/.openclaw/tmp/<scope>-pr<N>-review/findings-terra.md`
-- `~/.openclaw/workspace/.openclaw/tmp/<scope>-pr<N>-review/findings-glm.md`
-- `~/.openclaw/workspace/.openclaw/tmp/<scope>-pr<N>-review/findings-qwen.md`
+Output file pattern (in the review directory, one per model):
+- `<review-dir>/findings-terra.md`
+- `<review-dir>/findings-glm.md`
+- `<review-dir>/findings-qwen.md`
 
 Keep labels short but descriptive enough to identify the scope and model.
 
@@ -527,8 +527,8 @@ python3 ~/.openclaw/workspace/scripts/subagent-view.py <session-id> --messages
 python3 ~/.openclaw/workspace/scripts/subagent-view.py <session-id> --full
 
 # Check if a reviewer wrote its output file
-ls -la ~/.openclaw/workspace/.openclaw/tmp/<scope>-pr<N>-review/findings-*.md
-cat ~/.openclaw/workspace/.openclaw/tmp/<scope>-pr<N>-review/findings-<model>.md
+ls -la <review-dir>/findings-*.md
+cat <review-dir>/findings-<model>.md
 ```
 
 Quick recent-subagent listing:
