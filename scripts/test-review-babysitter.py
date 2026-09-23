@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import fcntl
 import stat
 import tempfile
 from pathlib import Path
@@ -68,6 +69,11 @@ def run() -> None:
                           "reasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===\n"
                           "Quality summary: wrote 1 ===FINDING=== block.")
         assert bs.artifact_state(root, "findings.md")[0] == "valid"
+        # L1 (r4): template placeholder values are invalid even with all fields.
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: <one line title>\nfile: <path>\n"
+                          "line: <line_number>\nreasoning: <what the code does>\n"
+                          "fix: <concrete fix>\ntrace: <concrete trace or N/A>\n===END_FINDING===")
+        assert bs.artifact_state(root, "findings.md")[0] == "invalid"
 
         # --- classify -------------------------------------------------------
         write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
@@ -77,27 +83,47 @@ def run() -> None:
         for status in ("done", "failed", "killed", "aborted", None):
             assert bs.classify(session(status), root, entry(), clock_ms=now)[0] == "lost"
 
-        # M2: absent session needs two-poll stability before "done"
+        # M2 (r4): absent session needs TWO consecutive absent polls plus a
+        # stable artifact before "done".
         write_valid(root)
         _, obs1 = bs.classify(None, root, entry(), clock_ms=now)
         assert bs.classify(None, root, entry(), clock_ms=now)[0] == "unknown"
-        prev = {"artifactObservation": obs1}
+        prev = {"artifactObservation": obs1}  # artifact stable, but session was present
+        assert bs.classify(None, root, entry(), prev, clock_ms=now)[0] == "unknown"
+        prev = {"artifactObservation": obs1, "sessionAbsent": True}
         assert bs.classify(None, root, entry(), prev, clock_ms=now)[0] == "done"
         (root / "findings.md").unlink()
         assert bs.classify(None, root, entry(), prev, clock_ms=now)[0] == "unknown"
 
-        # M4: stalled-with-artifact requires two consecutive STALE polls
+        # M4 (r3) + H2 (r4): stalled-with-artifact requires two consecutive
+        # STALE polls, an unchanged valid artifact, AND no transcript growth.
         write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
-        recent = session("running", now)
+        sess_file = root / "reviewer.jsonl"
+        sess_file.write_text('{"type":"message"}\n')
+        recent = session("running", now, sessionFile=str(sess_file))
         assert bs.classify(recent, root, entry(), clock_ms=now)[0] == "active"
-        stale = session("running", now - (bs.STALL_THRESHOLD + 1) * 1000)
+        stale = session("running", now - (bs.STALL_THRESHOLD + 1) * 1000,
+                        sessionFile=str(sess_file))
         first, observation = bs.classify(stale, root, entry(), clock_ms=now)
         assert first == "hung"
+        trans = bs.transcript_obs(stale)
+        assert trans is not None
         prev = {"artifactObservation": observation}  # previous poll NOT stale
         again, observation = bs.classify(stale, root, entry(), prev, clock_ms=now)
         assert again == "hung"  # still only one stale poll
         prev = {"artifactObservation": observation, "stale": True}
+        assert bs.classify(stale, root, entry(), prev, clock_ms=now)[0] == "hung"  # no transcript evidence yet
+        prev = {"artifactObservation": observation, "stale": True,
+                "transcriptObservation": trans}
         assert bs.classify(stale, root, entry(), prev, clock_ms=now)[0] == "stalled-with-artifact"
+        # H2 (r4): transcript GROWTH proves liveness even with stale timestamps
+        # (session-store timestamps freeze mid-turn — verified live in round 4).
+        sess_file.write_text('{"type":"message"}\n{"type":"message"}\n')
+        assert bs.classify(stale, root, entry(), prev, clock_ms=now)[0] == "active"
+        sess_file.write_text('{"type":"message"}\n')
+        trans2 = bs.transcript_obs(stale)
+        prev = {"artifactObservation": observation, "stale": True,
+                "transcriptObservation": trans2}
         # Changing artifact blocks terminality even with stale history
         (root / "findings.md").write_text("===FINDING===\nseverity: High\n===END_FINDING===\nSummary v2")
         assert bs.classify(stale, root, entry(), prev, clock_ms=now)[0] == "hung"
@@ -141,6 +167,12 @@ def run() -> None:
         try:
             bs.validate_config({**config, "deadlineMs": "2026-09-24T00:00:00Z"})
             raise AssertionError("string deadlineMs accepted")
+        except ValueError:
+            pass
+        # M1 (r4): an empty panel is a config error, never a successful round.
+        try:
+            bs.validate_config({**config, "models": []})
+            raise AssertionError("empty models accepted")
         except ValueError:
             pass
         # M8: duplicate file / sessionKey rejected
@@ -310,6 +342,59 @@ def run() -> None:
         saved = json.loads(bs.runtime_path(h2b_state).read_text())
         assert saved["round"] == "monitor-error"
         assert saved.get("lastInternalError") == "persistent"
+
+        # H1 (r4): a duplicate instance (lock already held) exits 0 — a running
+        # peer is steady state, not a systemd restart-loop trigger.
+        lock_dir = root / "locktest"
+        lock_dir.mkdir()
+        lock_state = lock_dir / "pending-state.json"
+        lock_state.write_text(json.dumps(h2_config))
+        lock_path = lock_state.with_suffix(".json.lock")
+        with lock_path.open("w") as lock_handle:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            rc = bs.main_impl(lock_state, sleep_fn=lambda s: None)
+            assert rc == 0, f"lock contention must exit 0, got {rc}"
+
+        # M3 (r4): restart with a persisted TERMINAL runtime retries the wake
+        # instead of re-monitoring and erasing the record.
+        replay_dir = root / "replay"
+        replay_dir.mkdir()
+        replay_state = replay_dir / "pending-state.json"
+        replay_state.write_text(json.dumps(h2_config))
+        replay_runtime = bs.runtime_path(replay_state)
+        replay_runtime.write_text(json.dumps(
+            {"round": "monitor-error", "wakeError": "gateway down"}))
+        replay_calls = []
+        try:
+            def replay_run(argv, **kwargs):
+                replay_calls.append(argv)
+                class Result:
+                    returncode = 1
+                    stderr = "still down"
+                return Result()
+            bs.subprocess.run = replay_run
+            rc = bs.main_impl(replay_state, sleep_fn=lambda s: None)
+            assert rc == 1, f"failed wake retry must exit 1, got {rc}"
+        finally:
+            bs.subprocess.run = original_run
+        assert replay_calls and replay_calls[0][1] == "system", "wake must be retried, not monitored"
+        saved = json.loads(replay_runtime.read_text())
+        assert saved["round"] == "monitor-error" and saved["wakeDelivered"] is False
+
+        # M5 (r4): a JSON object without a sessions array is an error, not an
+        # empty review (silent {} would mark every reviewer absent).
+        try:
+            def weird_sessions(argv, **kwargs):
+                class Result:
+                    returncode = 0
+                    stderr = ""
+                    stdout = json.dumps({"error": "internal", "count": 0})
+                return Result()
+            bs.subprocess.run = weird_sessions
+            mapping = bs.query_sessions("main")
+        finally:
+            bs.subprocess.run = original_run
+        assert "__error__" in mapping and "shape" in mapping["__error__"]
 
         # L2 (r3): duplicate session keys keep the FRESHEST entry, no sentinel.
         dedup_input = [

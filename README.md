@@ -14,7 +14,7 @@ The workflow is designed for any capable coding agent that can:
 - use GitHub CLI/API for repository access and PR comments,
 - consolidate structured findings.
 
-It has been tested in production-style workflows with **OpenClaw** and **Hermes**.
+It has been tested in production-style workflows with **OpenClaw** and **Hermes**. The detached completion watchdog is OpenClaw-CLI + Linux/systemd only; the rest of the workflow (orchestrator, reviewer prompts, artifact contract) is platform-agnostic and works with any agent runtime, including Hermes.
 
 > **Platform note:** the detached babysitter watchdog is Linux-only (uses `fcntl` and a `systemd-run --user` unit with `Restart=on-failure`). On macOS/non-systemd hosts, run the skill without the watchdog or use the (unverified) `nohup` fallback. The watchdog resolves binaries from `OPENCLAW_BIN`/`PATH` — set both explicitly in the unit environment.
 

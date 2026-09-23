@@ -15,15 +15,12 @@ POLL_INTERVAL = int(os.environ.get("BABYSITTER_POLL_INTERVAL", "300"))
 STALL_THRESHOLD = int(os.environ.get("BABYSITTER_STALL_THRESHOLD", "900"))
 OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
 AGENT_ID = os.environ.get("OPENCLAW_AGENT_ID", "main")
-SESSIONS_DIR = Path(os.environ.get(
-    "OPENCLAW_SESSIONS_DIR",
-    str(Path.home() / ".openclaw" / "agents" / AGENT_ID / "sessions"),
-))
 TERMINAL_MODEL_STATES = {"done", "lost", "stalled-with-artifact"}
 TERMINAL_ROUNDS = {"complete", "complete-with-losses", "deadline", "monitor-error"}
 FINDING_RE = re.compile(r"===FINDING===\n.*?\n===END_FINDING===", re.S)
 MARKER_LINE_RE = re.compile(r"^\s*===(?:FINDING|END_FINDING)===\s*$")
 REQUIRED_FIELDS = ("severity", "title", "file", "line", "reasoning", "fix", "trace")
+PLACEHOLDER_RE = re.compile(r"^<.*>$")
 SEVERITIES = {"critical", "high", "medium", "low"}
 MAX_CONSECUTIVE_ERRORS = 3
 DIAGNOSTIC_TAIL_BYTES = 256 * 1024
@@ -71,15 +68,32 @@ def agent_id_for(session_key: str | None) -> str:
     return AGENT_ID
 
 
+def transcript_obs(session: dict) -> dict | None:
+    """Observe the session transcript file (size + mtime) for liveness."""
+    try:
+        raw = session.get("sessionFile")
+        fallback_dir = sessions_dir_for(agent_id_for(session.get("key")))
+        path = Path(raw) if raw else fallback_dir / f"{session.get('sessionId', '')}.jsonl"
+        stat = path.stat()
+        return {"size": stat.st_size, "mtimeNs": stat.st_mtime_ns}
+    except OSError:
+        return None
+
+
 def _block_valid(block: str) -> bool:
-    """A finding block must carry every required field with a known severity."""
+    """A finding block must carry every required field with a known severity.
+
+    Template placeholder values (`<one line title>`) do not count as content:
+    a reviewer parroting the task template carries zero information.
+    """
     fields: dict[str, str] = {}
     for line in block.splitlines():
         if ":" in line:
             key, value = line.split(":", 1)
             fields[key.strip().lower()] = value.strip()
     for field in REQUIRED_FIELDS:
-        if not fields.get(field):
+        value = fields.get(field)
+        if not value or PLACEHOLDER_RE.match(value):
             return False
     return fields["severity"].lower() in SEVERITIES
 
@@ -127,7 +141,12 @@ def query_sessions(agent_id: str = AGENT_ID) -> dict:
         if out.returncode != 0:
             raise RuntimeError(out.stderr.strip() or f"openclaw sessions exited {out.returncode}")
         payload = json.loads(out.stdout)
-        sessions = payload.get("sessions", payload) if isinstance(payload, dict) else payload
+        sessions = payload.get("sessions") if isinstance(payload, dict) else payload
+        if not isinstance(sessions, list):
+            # A JSON object without a sessions array is a malformed envelope,
+            # not an empty review: route it through the error sentinel instead
+            # of silently treating every reviewer session as absent.
+            raise RuntimeError("unexpected sessions payload shape")
         mapping: dict = {}
 
         def _activity(item: dict) -> int:
@@ -210,9 +229,14 @@ def classify(
     previous = previous or {}
 
     if session is None:
-        # A structurally valid artifact alone is not enough: require it to have
-        # been observed unchanged on the previous poll as well.
-        if artifact == "valid" and previous.get("artifactObservation") == observation:
+        # Absence must itself be stable: the session must have been absent on
+        # the previous poll too. A transiently partial sessions listing must
+        # not shortcut a running reviewer to "done" (r4 M2).
+        if (
+            artifact == "valid"
+            and previous.get("sessionAbsent")
+            and previous.get("artifactObservation") == observation
+        ):
             return "done", observation
         return "unknown", observation
 
@@ -222,15 +246,27 @@ def classify(
 
     activity = stale_activity_ts(session)
     current = now_ms() if clock_ms is None else clock_ms
-    # Missing timestamps cannot confirm liveness: treat as stale and let the
-    # two-consecutive-poll stability rule gate terminality.
+    # Session-store timestamps only advance at turn boundaries, so they freeze
+    # mid-turn and age purely with wall clock (r4 H2). Transcript growth is the
+    # real liveness signal for a still-running session.
     stale = activity is None or current - activity > STALL_THRESHOLD * 1000
-    if not stale:
+    transcript = transcript_obs(session)
+    prev_transcript = previous.get("transcriptObservation")
+    growing = (
+        transcript is not None
+        and prev_transcript is not None
+        and prev_transcript != transcript
+    )
+    if not stale or growing:
         return "active", observation
     # Terminality for a still-running session requires TWO consecutive stale
-    # polls with an unchanged valid artifact (previous poll must also be stale).
+    # polls, an unchanged valid artifact, AND a transcript that did not grow
+    # between them. Without transcript evidence of a stall, stay non-terminal:
+    # the deadline remains the backstop.
     if (
         artifact == "valid"
+        and transcript is not None
+        and prev_transcript == transcript
         and previous.get("stale")
         and previous.get("artifactObservation") == observation
     ):
@@ -264,12 +300,17 @@ def evaluate_round(
             clock_ms=current,
         )
         activity = stale_activity_ts(session) if session else None
+        transcript = transcript_obs(session) if session else None
         entry["status"] = state
+        entry["sessionAbsent"] = session is None
         entry["stale"] = bool(
             session and session.get("status") == "running"
             and (activity is None or current - activity > STALL_THRESHOLD * 1000)
+            and old.get("transcriptObservation") is not None
+            and old.get("transcriptObservation") == transcript
         )
         entry["artifactObservation"] = observation
+        entry["transcriptObservation"] = transcript
         if activity is not None:
             entry["lastActivityAt"] = activity
         if state == "lost":
@@ -335,8 +376,10 @@ def validate_config(config: dict) -> None:
             raise ValueError(f"pending-state missing {field}")
     if not isinstance(config["deadlineMs"], (int, float)) or isinstance(config["deadlineMs"], bool):
         raise ValueError("deadlineMs must be an epoch-milliseconds number")
-    if not isinstance(config["models"], list):
-        raise ValueError("models must be a list")
+    if not isinstance(config["models"], list) or not config["models"]:
+        # An empty panel would satisfy all([]) and report a "successful"
+        # zero-reviewer round; that must be a config error, never a round (M1).
+        raise ValueError("models must be a non-empty list")
     review_dir = Path(config["reviewDir"])
     if not review_dir.is_dir():
         raise ValueError("reviewDir does not exist")
@@ -388,9 +431,36 @@ def main_impl(config_path: Path, sleep_fn=time.sleep) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print("[babysitter] another instance already holds the lock", file=sys.stderr)
-            return 3
+            # A running peer is the desired steady state, not a failure: exit 0
+            # so systemd Restart=on-failure does not loop on duplicate starts.
+            return 0
 
-        runtime: dict = {"babysitterPid": os.getpid(), "round": "monitoring", "models": []}
+        # Restart continuity (M3): seed from the persisted runtime so model
+        # observations and stability history survive a restart instead of
+        # resetting the two-poll gates and error counters.
+        seeded: dict = {}
+        try:
+            if state_path.exists():
+                seeded = load_json(state_path)
+        except Exception:
+            seeded = {}
+        if seeded.get("round") in TERMINAL_ROUNDS:
+            # Restart after a terminal record (typically a failed wake): retry
+            # the wake instead of re-monitoring and erasing the record.
+            seeded["babysitterPid"] = os.getpid()
+            print(f"[babysitter] terminal state {seeded['round']} on restart; retrying wake",
+                  flush=True)
+            wake_key: str | None = None
+            try:
+                wake_key = load_json(config_path).get("orchestratorSessionKey")
+            except Exception:
+                pass
+            if not wake_key:
+                # No key, no progress: exit 0 (see _terminal) to avoid looping.
+                return 0
+            return 0 if wake_orchestrator(None, state_path, seeded, wake_key) else 1
+        runtime: dict = {**seeded, "babysitterPid": os.getpid()}
+        runtime.setdefault("round", "monitoring")
         print(f"[babysitter] config={config_path} runtime={state_path}", flush=True)
         config_errors = session_errors = write_errors = internal_errors = 0
         last_good_key: str | None = None
@@ -419,6 +489,8 @@ def main_impl(config_path: Path, sleep_fn=time.sleep) -> int:
                     runtime["lastConfigError"] = str(exc)
                     if not safe_save(state_path, runtime):
                         write_errors += 1
+                    else:
+                        write_errors = 0
                     if config_errors >= MAX_CONSECUTIVE_ERRORS:
                         # Terminal: must wake, never silently restart-loop.
                         return _terminal(None, state_path, runtime, last_good_key)
@@ -430,22 +502,34 @@ def main_impl(config_path: Path, sleep_fn=time.sleep) -> int:
                     session_errors += 1
                     runtime["sessionQueryErrors"] = session_errors
                     runtime["lastSessionError"] = sessions["__error__"]
+                    # Artifact-only fallback (M4): while the sessions CLI is
+                    # down, stable valid artifacts can still drive terminality;
+                    # the flag records that the round completed without a
+                    # session query. Short sleep, like the config-error path.
+                    runtime["sessionQueryFallback"] = True
+                    runtime = evaluate_round(config, runtime, {})
                     if not safe_save(state_path, runtime):
                         write_errors += 1
+                    else:
+                        write_errors = 0
+                    if runtime["round"] in TERMINAL_ROUNDS:
+                        return 0 if wake_orchestrator(config, state_path, runtime) else 1
                     if session_errors >= MAX_CONSECUTIVE_ERRORS:
                         return _terminal(config, state_path, runtime, last_good_key)
-                    sleep_fn(POLL_INTERVAL)
+                    sleep_fn(min(POLL_INTERVAL, 30))
                     continue
 
                 session_errors = 0
                 runtime["sessionQueryErrors"] = 0
+                runtime.pop("lastSessionError", None)
+                runtime.pop("sessionQueryFallback", None)
                 runtime = evaluate_round(config, runtime, sessions)
                 if not safe_save(state_path, runtime):
                     write_errors += 1
-                    if write_errors >= MAX_CONSECUTIVE_ERRORS:
-                        return _terminal(config, state_path, runtime, last_good_key)
                 else:
                     write_errors = 0
+                if write_errors >= MAX_CONSECUTIVE_ERRORS:
+                    return _terminal(config, state_path, runtime, last_good_key)
                 if runtime["round"] in TERMINAL_ROUNDS:
                     return 0 if wake_orchestrator(config, state_path, runtime) else 1
                 # H2: the internal-error counter is a CONSECUTIVE-error policy;
@@ -459,6 +543,8 @@ def main_impl(config_path: Path, sleep_fn=time.sleep) -> int:
                 runtime["lastInternalError"] = str(exc)
                 if not safe_save(state_path, runtime):
                     write_errors += 1
+                else:
+                    write_errors = 0
                 if internal_errors >= MAX_CONSECUTIVE_ERRORS or write_errors >= MAX_CONSECUTIVE_ERRORS:
                     return _terminal(config, state_path, runtime, last_good_key)
             sleep_fn(POLL_INTERVAL)
@@ -467,7 +553,9 @@ def main_impl(config_path: Path, sleep_fn=time.sleep) -> int:
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: review-babysitter.py <pending-state.json>", file=sys.stderr)
-        return 2
+        # A deterministic invocation error cannot be fixed by a restart: exit 0
+        # so systemd Restart=on-failure does not loop forever (H1).
+        return 0
     return main_impl(Path(sys.argv[1]).resolve())
 
 
