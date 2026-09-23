@@ -22,6 +22,9 @@ SESSIONS_DIR = Path(os.environ.get(
 TERMINAL_MODEL_STATES = {"done", "lost", "stalled-with-artifact"}
 TERMINAL_ROUNDS = {"complete", "complete-with-losses", "deadline", "monitor-error"}
 FINDING_RE = re.compile(r"===FINDING===\n.*?\n===END_FINDING===", re.S)
+MARKER_LINE_RE = re.compile(r"^\s*===(?:FINDING|END_FINDING)===\s*$")
+REQUIRED_FIELDS = ("severity", "title", "file", "line", "reasoning", "fix", "trace")
+SEVERITIES = {"critical", "high", "medium", "low"}
 MAX_CONSECUTIVE_ERRORS = 3
 DIAGNOSTIC_TAIL_BYTES = 256 * 1024
 
@@ -52,30 +55,62 @@ def safe_save(path: Path, data: dict) -> bool:
         return False
 
 
+def sessions_dir_for(agent_id: str) -> Path:
+    return Path(os.environ.get(
+        "OPENCLAW_SESSIONS_DIR",
+        str(Path.home() / ".openclaw" / "agents" / agent_id / "sessions"),
+    ))
+
+
+def agent_id_for(session_key: str | None) -> str:
+    """Resolve the owning agent id from an `agent:<id>:...` session key."""
+    if session_key and session_key.startswith("agent:"):
+        parts = session_key.split(":")
+        if len(parts) > 1 and parts[1]:
+            return parts[1]
+    return AGENT_ID
+
+
+def _block_valid(block: str) -> bool:
+    """A finding block must carry every required field with a known severity."""
+    fields: dict[str, str] = {}
+    for line in block.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            fields[key.strip().lower()] = value.strip()
+    for field in REQUIRED_FIELDS:
+        if not fields.get(field):
+            return False
+    return fields["severity"].lower() in SEVERITIES
+
+
 def artifact_state(review_dir: Path, filename: str) -> tuple[str, dict | None]:
     """Return missing|valid|invalid and a stat observation."""
     if not filename:
         return "missing", None
     path = review_dir / filename
-    if not path.is_file():
-        return "missing", None
-    stat = path.stat()
-    obs = {"size": stat.st_size, "mtimeNs": stat.st_mtime_ns}
     try:
+        if not path.is_file():
+            return "missing", None
+        stat = path.stat()
+        obs = {"size": stat.st_size, "mtimeNs": stat.st_mtime_ns}
         raw = path.read_bytes()
-        text = raw.decode("utf-8-sig", errors="ignore")
     except OSError:
-        return "invalid", obs
+        # TOCTOU with the reviewer rewriting its file: observe again next poll.
+        return "missing", None
+    text = raw.decode("utf-8-sig", errors="ignore")
     # Normalize line endings so CRLF files and BOMs do not invalidate a review.
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         return "invalid", obs
     blocks = FINDING_RE.findall(text)
     remainder = FINDING_RE.sub("", text).strip()
-    if "===FINDING===" in remainder or "===END_FINDING===" in remainder:
+    # Stray markers count as truncation evidence only when they appear as
+    # marker-only lines; summaries may legitimately mention the token inline.
+    if any(MARKER_LINE_RE.match(line) for line in remainder.splitlines()):
         return "invalid", obs
     if blocks:
-        return "valid", obs
+        return ("valid" if all(_block_valid(block) for block in blocks) else "invalid"), obs
     # Zero findings: the sentinel line (optionally followed by a summary) is valid;
     # anything else without blocks is a truncated/foreign file.
     if text == "NO FINDINGS" or text.startswith("NO FINDINGS\n"):
@@ -83,10 +118,10 @@ def artifact_state(review_dir: Path, filename: str) -> tuple[str, dict | None]:
     return "invalid", obs
 
 
-def query_sessions() -> dict:
+def query_sessions(agent_id: str = AGENT_ID) -> dict:
     try:
         out = subprocess.run(
-            [OPENCLAW, "sessions", "--json", "--limit", "all"],
+            [OPENCLAW, "sessions", "--json", "--limit", "all", "--agent", agent_id],
             capture_output=True, text=True, timeout=60,
         )
         if out.returncode != 0:
@@ -94,11 +129,16 @@ def query_sessions() -> dict:
         payload = json.loads(out.stdout)
         sessions = payload.get("sessions", payload) if isinstance(payload, dict) else payload
         mapping: dict = {}
+
+        def _activity(item: dict) -> int:
+            return item.get("lastInteractionAt") or item.get("updatedAt") or item.get("sessionStartedAt") or 0
+
         for item in sessions:
             if isinstance(item, dict) and item.get("key"):
-                if item["key"] in mapping:
-                    mapping["__duplicate__"] = item["key"]
-                mapping[item["key"]] = item
+                key = item["key"]
+                # Duplicate (recycled) keys: keep the freshest observation.
+                if key not in mapping or _activity(item) >= _activity(mapping[key]):
+                    mapping[key] = item
         return mapping
     except Exception as exc:
         return {"__error__": str(exc)}
@@ -110,7 +150,8 @@ def last_assistant_text(session: dict | None) -> str:
         if not session:
             return ""
         raw = session.get("sessionFile")
-        path = Path(raw) if raw else SESSIONS_DIR / f"{session.get('sessionId', '')}.jsonl"
+        fallback_dir = sessions_dir_for(agent_id_for(session.get("key")))
+        path = Path(raw) if raw else fallback_dir / f"{session.get('sessionId', '')}.jsonl"
         size = path.stat().st_size
         with path.open("rb") as handle:
             if size > DIAGNOSTIC_TAIL_BYTES:
@@ -325,6 +366,14 @@ def _terminal(config: dict | None, state_path: Path, runtime: dict,
     runtime["round"] = "monitor-error"
     runtime["completedAtMs"] = now_ms()
     safe_save(state_path, runtime)
+    key = fallback_key or (config or {}).get("orchestratorSessionKey")
+    if not key:
+        # Nothing to wake and no way to learn the key: exit 0 so systemd's
+        # Restart=on-failure does not loop forever on an unrecoverable config.
+        runtime["wakeDelivered"] = False
+        runtime["wakeError"] = runtime.get("wakeError", "no orchestratorSessionKey available")
+        safe_save(state_path, runtime)
+        return 0
     return 0 if wake_orchestrator(config, state_path, runtime, fallback_key) else 1
 
 
@@ -351,9 +400,11 @@ def main_impl(config_path: Path, sleep_fn=time.sleep) -> int:
             try:
                 try:
                     config = load_json(config_path)
+                    # Capture the wake key before validation: a config that
+                    # parses but fails validation still tells us who to wake.
+                    last_good_key = config.get("orchestratorSessionKey") or last_good_key
                     validate_config(config)
                     config_errors = 0
-                    last_good_key = config.get("orchestratorSessionKey") or last_good_key
                     runtime.pop("configErrors", None)
                     runtime.pop("lastConfigError", None)
                 except FileNotFoundError:
@@ -374,7 +425,7 @@ def main_impl(config_path: Path, sleep_fn=time.sleep) -> int:
                     sleep_fn(min(POLL_INTERVAL, 30))
                     continue
 
-                sessions = query_sessions()
+                sessions = query_sessions(agent_id_for(last_good_key or config.get("orchestratorSessionKey")))
                 if "__error__" in sessions:
                     session_errors += 1
                     runtime["sessionQueryErrors"] = session_errors
@@ -397,6 +448,11 @@ def main_impl(config_path: Path, sleep_fn=time.sleep) -> int:
                     write_errors = 0
                 if runtime["round"] in TERMINAL_ROUNDS:
                     return 0 if wake_orchestrator(config, state_path, runtime) else 1
+                # H2: the internal-error counter is a CONSECUTIVE-error policy;
+                # a fully successful poll resets it like the other counters.
+                internal_errors = 0
+                runtime.pop("internalErrors", None)
+                runtime.pop("lastInternalError", None)
             except Exception as exc:
                 internal_errors += 1
                 runtime["internalErrors"] = internal_errors

@@ -41,10 +41,10 @@ def run() -> None:
         assert bs.artifact_state(root, "findings.md")[0] == "invalid"
         (root / "findings.md").write_text("===FINDING===\nseverity: High")
         assert bs.artifact_state(root, "findings.md")[0] == "invalid"
-        write_valid(root, "===FINDING===\nseverity: High\n===END_FINDING===\nSummary")
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
         assert bs.artifact_state(root, "findings.md")[0] == "valid"
         # L2: CRLF and BOM tolerance
-        write_valid(root, "===FINDING===\r\nseverity: High\r\n===END_FINDING===\r\nSummary\r\n")
+        write_valid(root, "===FINDING===\r\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
         assert bs.artifact_state(root, "findings.md")[0] == "valid"
         write_valid(root, "NO FINDINGS\n\nQuality summary: nothing found.")
         assert bs.artifact_state(root, "findings.md")[0] == "valid"
@@ -52,12 +52,25 @@ def run() -> None:
         assert bs.artifact_state(root, "findings.md")[0] == "valid"
         write_valid(root, "loose text without blocks")
         assert bs.artifact_state(root, "findings.md")[0] == "invalid"
-        # M3: NO FINDINGS followed by stray FINDING marker is still invalid
+        # M3 (r3): NO FINDINGS followed by a stray MARKER-ONLY line is invalid...
         write_valid(root, "NO FINDINGS\n===FINDING===\n")
         assert bs.artifact_state(root, "findings.md")[0] == "invalid"
+        # ...but a summary merely MENTIONING the token inline is valid.
+        write_valid(root, "NO FINDINGS\n\nQuality summary: no ===FINDING=== blocks emitted.")
+        assert bs.artifact_state(root, "findings.md")[0] == "valid"
+        # M1 (r3): structurally complete blocks must carry all required fields.
+        write_valid(root, "===FINDING===\n\n===END_FINDING===")
+        assert bs.artifact_state(root, "findings.md")[0] == "invalid"
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: x\nfile: a.py\nline: 1\n"
+                          "reasoning: r\nfix: f\n===END_FINDING===")
+        assert bs.artifact_state(root, "findings.md")[0] == "invalid"  # trace missing
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: x\nfile: a.py\nline: 1\n"
+                          "reasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===\n"
+                          "Quality summary: wrote 1 ===FINDING=== block.")
+        assert bs.artifact_state(root, "findings.md")[0] == "valid"
 
         # --- classify -------------------------------------------------------
-        write_valid(root, "===FINDING===\nseverity: High\n===END_FINDING===\nSummary")
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
         for status in ("done", "failed", "killed", "aborted", None):
             assert bs.classify(session(status), root, entry(), clock_ms=now)[0] == "done"
         (root / "findings.md").unlink()
@@ -74,7 +87,7 @@ def run() -> None:
         assert bs.classify(None, root, entry(), prev, clock_ms=now)[0] == "unknown"
 
         # M4: stalled-with-artifact requires two consecutive STALE polls
-        write_valid(root, "===FINDING===\nseverity: High\n===END_FINDING===\nSummary")
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
         recent = session("running", now)
         assert bs.classify(recent, root, entry(), clock_ms=now)[0] == "active"
         stale = session("running", now - (bs.STALL_THRESHOLD + 1) * 1000)
@@ -96,7 +109,7 @@ def run() -> None:
         assert bs.classify(no_ts, root, entry(), prev, clock_ms=now)[0] == "hung"
 
         # --- evaluate_round -------------------------------------------------
-        write_valid(root, "===FINDING===\nseverity: High\n===END_FINDING===\nSummary")
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
         config = {
             "reviewDir": str(root),
             "deadlineMs": now + 1000,
@@ -194,24 +207,128 @@ def run() -> None:
             bs.subprocess.run = original_run
         assert json.loads(runtime_path.read_text())["round"] == "stopped-config-gone"
 
-        # Malformed config x3 -> monitor-error with wake attempt (delivery fails
-        # because OPENCLAW_BIN points at /bin/false), exit 1.
+        # H1b/M4 (r3): malformed config x3 -> monitor-error; with no wake key
+        # available the process exits 0 so systemd does NOT restart-loop.
         state_dir2 = root / "h1b"
         state_dir2.mkdir()
         bad_state = state_dir2 / "pending-state.json"
         bad_state.write_text("{not json")
-        env_backup = dict(os.environ)
         try:
-            os.environ["OPENCLAW_BIN"] = "/bin/false"
+            def never_event(argv, **kwargs):
+                raise AssertionError("no wake should be attempted without a key")
+            bs.subprocess.run = never_event
             rc = bs.main_impl(bad_state, sleep_fn=lambda s: None)
-            assert rc == 1, f"config-error path should exit 1 after failed wake, got {rc}"
+            assert rc == 0, f"no-key monitor-error must not restart-loop, got {rc}"
         finally:
-            os.environ.clear(); os.environ.update(env_backup)
+            bs.subprocess.run = original_run
         saved = json.loads(bs.runtime_path(bad_state).read_text())
         assert saved["round"] == "monitor-error"
         assert saved["wakeDelivered"] is False
         assert "configErrors" in saved and "lastConfigError" in saved
 
+        # H1c (r3): config that PARSES but fails validation still yields the
+        # wake key; the wake is attempted (and fails with a fake), exit 1.
+        state_dir3 = root / "h1c"
+        state_dir3.mkdir()
+        bad_models_state = state_dir3 / "pending-state.json"
+        bad_models_state.write_text(json.dumps(
+            {**config, "models": "not-a-list"}))
+        wake_calls = []
+        try:
+            def failing_run(argv, **kwargs):
+                wake_calls.append(argv)
+                class Result:
+                    returncode = 1
+                    stderr = "gateway down"
+                return Result()
+            bs.subprocess.run = failing_run
+            rc = bs.main_impl(bad_models_state, sleep_fn=lambda s: None)
+            assert rc == 1, f"keyed monitor-error should exit 1 after failed wake, got {rc}"
+        finally:
+            bs.subprocess.run = original_run
+        assert wake_calls and any(argv[1] == "system" for argv in wake_calls)
+        saved = json.loads(bs.runtime_path(bad_models_state).read_text())
+        assert saved["round"] == "monitor-error" and saved["wakeDelivered"] is False
+
+        # H2 (r3): internal_errors is CONSECUTIVE — scattered exceptions with
+        # healthy polls in between must NOT terminate the round.
+        h2_state = root / "h2" / "pending-state.json"
+        h2_state.parent.mkdir()
+        h2_config = {**config, "deadlineMs": bs.now_ms() + 3_600_000}  # far future
+        h2_state.write_text(json.dumps(h2_config))
+        poll_state = {"n": 0}
+        real_evaluate = bs.evaluate_round
+
+        def flaky_evaluate(config_arg, runtime, sessions, **kwargs):
+            poll_state["n"] += 1
+            # Raise on polls 1, 3 and 5 (never twice in a row).
+            if poll_state["n"] in (1, 3, 5):
+                raise RuntimeError(f"transient {poll_state['n']}")
+            return real_evaluate(config_arg, runtime, sessions, **kwargs)
+
+        # Polls 1/3/5 raise (never consecutively); after poll 6 the sleeper
+        # removes the config so poll 7 stops cleanly (stopped-config-gone).
+        def sleeper(_s):
+            if poll_state["n"] >= 6:
+                h2_state.unlink()
+        try:
+            def ok_sessions(argv, **kwargs):
+                class Result:
+                    returncode = 0
+                    stderr = ""
+                    stdout = json.dumps(
+                        {"sessions": [{"key": "k", "status": "running",
+                                       "lastInteractionAt": bs.now_ms()}]}
+                    )
+                return Result()
+            bs.subprocess.run = ok_sessions
+            bs.evaluate_round = flaky_evaluate
+            (root / "findings.md").unlink(missing_ok=True)  # keep the artifact out of the way
+            rc = bs.main_impl(h2_state, sleep_fn=sleeper)
+            assert rc == 0
+        finally:
+            bs.subprocess.run = original_run
+            bs.evaluate_round = real_evaluate
+        assert poll_state["n"] >= 6, f"expected >=6 polls before clean stop, got {poll_state['n']}"
+        saved = json.loads(bs.runtime_path(h2_state).read_text())
+        assert saved["round"] == "stopped-config-gone"
+        assert "internalErrors" not in saved and "lastInternalError" not in saved
+        # H2b: three BACK-TO-BACK internal errors DO terminate with monitor-error.
+        h2b_state = root / "h2b" / "pending-state.json"
+        h2b_state.parent.mkdir()
+        h2b_state.write_text(json.dumps(h2_config))
+        try:
+            def always_raises(config_arg, runtime, sessions, **kwargs):
+                raise RuntimeError("persistent")
+            bs.subprocess.run = ok_sessions
+            bs.evaluate_round = always_raises
+            rc = bs.main_impl(h2b_state, sleep_fn=lambda s: None)
+            assert rc == 0
+        finally:
+            bs.subprocess.run = original_run
+            bs.evaluate_round = real_evaluate
+        saved = json.loads(bs.runtime_path(h2b_state).read_text())
+        assert saved["round"] == "monitor-error"
+        assert saved.get("lastInternalError") == "persistent"
+
+        # L2 (r3): duplicate session keys keep the FRESHEST entry, no sentinel.
+        dedup_input = [
+            {"key": "k", "status": "killed", "lastInteractionAt": 100},
+            {"key": "k", "status": "done", "lastInteractionAt": 900},
+        ]
+        try:
+            def dup_sessions(argv, **kwargs):
+                assert "--agent" in argv  # H1 (r3): agent id passed explicitly
+                class Result:
+                    returncode = 0
+                    stderr = ""
+                    stdout = json.dumps({"sessions": dedup_input})
+                return Result()
+            bs.subprocess.run = dup_sessions
+            mapping = bs.query_sessions("main")
+        finally:
+            bs.subprocess.run = original_run
+        assert mapping["k"]["status"] == "done" and "__duplicate__" not in mapping
         # L4: successful config load clears stale error fields
         runtime = {"configErrors": 1, "lastConfigError": "old"}
         good_state = state_dir / "pending-state.json"

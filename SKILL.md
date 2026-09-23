@@ -555,7 +555,7 @@ Terminal round states:
 - `complete`: every reviewer produced a usable artifact.
 - `complete-with-losses`: all reviewers are terminal but one or more are `lost`.
 - `deadline`: deadline reached with unresolved `active`, `hung`, or `unknown`.
-- `monitor-error`: three consecutive session-query or state-I/O failures.
+- `monitor-error`: the bounded consecutive-error limit (3) was reached on any of the four guarded failure paths — config load/validation, session query, runtime state write, or an internal exception. Diagnose which one fired via the runtime fields `lastConfigError`, `lastSessionError`, `lastInternalError`, and the error counters (`configErrors`, `sessionQueryErrors`, `internalErrors`).
 
 ### Explicit wake and recovery
 
@@ -567,7 +567,7 @@ openclaw system event --mode now \
   --text "Multireview babysitter <round>. Read <runtime-state-path>"
 ```
 
-Wake delivery is retried three times and recorded in the runtime state. Wake failure returns non-zero so systemd restarts the service and retries. On every wake, the orchestrator reads both configuration and runtime state, validates the exact current-round artifacts, and reports missing/lost reviewers.
+Wake delivery is retried three times and recorded in the runtime state. Wake failure with a known key returns non-zero so systemd restarts the service and retries. If no `orchestratorSessionKey` is available at all (e.g. the config never parsed), the watchdog records `monitor-error` with `wakeDelivered: false` and exits **0** — a restart could never learn the key, so looping would only burn CPU silently. On every wake, the orchestrator reads both configuration and runtime state, validates the exact current-round artifacts, and reports missing/lost reviewers.
 
 The script holds a single-instance lock for the review. A second babysitter exits without modifying state. Runtime writes use PID-unique temporary files plus `os.replace`. Configuration/state read errors use a bounded consecutive-error policy rather than crashing silently.
 
@@ -585,6 +585,7 @@ openclaw sessions --json --limit all | jq '.sessions[] | select(.key | contains(
 tail -c 262144 ~/.openclaw/agents/main/sessions/<session-id>.jsonl   | jq -r 'select(.type=="message") | select(.message.role=="assistant") | .message.content' | tail -20
 ```
 
+```
 # Check if a reviewer wrote its output file
 ls -la $HOME/.openclaw/workspace/.openclaw/tmp/<scope>-pr<N>-review/findings-*.md
 cat $HOME/.openclaw/workspace/.openclaw/tmp/<scope>-pr<N>-review/findings-<model>.md
