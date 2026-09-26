@@ -535,7 +535,7 @@ systemctl --user is-active "$UNIT"
 
 Do not run it as a long foreground `exec` command: that process belongs to the executor and can die at a turn/model/session boundary. `nohup ... &` is only a fallback when no user manager exists and must be verified after a later turn. Inspect the canonical service log with `journalctl --user -u "$UNIT"`.
 
-Two deliberate exit-0 paths keep `Restart=on-failure` from looping forever: a duplicate start when another instance already holds the lock (a running peer is steady state, not a failure), and a monitor-error with no `orchestratorSessionKey` available. Everything else that exits non-zero is a condition a restart can make progress on (e.g. a failed wake retry).
+Deliberate exit-0 paths keep `Restart=on-failure` from looping forever: the usage error (wrong argv), a duplicate start when another instance already holds the lock (a running peer is steady state, not a failure), a monitor-error with no `orchestratorSessionKey` available, a terminal-restart replay with no key available, `stopped-config-gone`, and every successful wake. Everything else that exits non-zero is a condition a restart can make progress on (e.g. a failed wake retry).
 
 ### State machine and artifact contract
 
@@ -544,12 +544,12 @@ A usable artifact is either exactly `NO FINDINGS` or one or more complete `===FI
 Per-model states:
 
 - `done`: non-running/pruned session plus valid artifact, OR a session absent on two consecutive polls with a stable valid artifact.
-- `lost`: present non-running session (`done`, `failed`, `killed`, `aborted`, null, or any future non-`running` status) without a valid artifact.
+- `lost`: present session with a KNOWN terminal status (`done`, `failed`, `error`, `killed`, `aborted`, `cancelled`, `canceled`, `archived`, `pruned`) without a valid artifact.
 - `active`: running with recent activity.
 - `active` also covers a running session whose timestamps look stale but whose transcript is still growing — session-store timestamps freeze mid-turn, so transcript growth is the real liveness signal.
 - `hung`: stale running session without a stable valid artifact, or stale with no transcript-growth evidence yet; non-terminal, the deadline is the backstop.
 - `stalled-with-artifact`: stale running session whose valid artifact AND transcript are unchanged across two consecutive polls; terminal but explicitly recorded.
-- `unknown`: session absent and no valid artifact; blocks until deadline.
+- `unknown`: session absent with no valid artifact, OR a present session whose status is missing/unrecognized (r5 M3 whitelist); non-terminal, the deadline is the backstop.
 
 A transcript `DONE: 0 findings` is diagnostic only. It never substitutes for the mandatory `NO FINDINGS` artifact.
 
@@ -558,7 +558,7 @@ Terminal round states:
 - `complete`: every reviewer produced a usable artifact.
 - `complete-with-losses`: all reviewers are terminal but one or more are `lost`.
 - `deadline`: deadline reached with unresolved `active`, `hung`, or `unknown`.
-- `monitor-error`: the bounded consecutive-error limit (3) was reached on any of the four guarded failure paths — config load/validation, session query, runtime state write, or an internal exception. Diagnose which one fired via the runtime fields `lastConfigError`, `lastSessionError`, `lastInternalError`, and the error counters (`configErrors`, `sessionQueryErrors`, `internalErrors`).
+- `monitor-error`: the bounded consecutive-error limit (3) was reached on one of the three guarded failure paths — config load/validation, runtime state write, or an internal exception. Session-query failures are deliberately NON-terminal (see the fallback note below); `sessionQueryErrors` and `lastSessionError` record them for diagnosis. Diagnose terminal monitor-errors via the runtime fields `lastConfigError`, `lastInternalError`, and the error counters (`configErrors`, `internalErrors`).
 - `stopped-config-gone`: the pending-state.json was removed while monitoring (e.g. cleaned up after publication). Clean stop, exit 0, and deliberately NO wake — there is nothing to report.
 
 The watchdog reads its own runtime file at startup: per-model observations and stability history survive a restart (including the wake-failure restart), and a restart that finds a persisted terminal round retries the wake instead of re-monitoring from scratch.
@@ -575,7 +575,7 @@ openclaw system event --mode now \
 
 Wake delivery is retried three times and recorded in the runtime state. Wake failure with a known key returns non-zero so systemd restarts the service and retries. If no `orchestratorSessionKey` is available at all (e.g. the config never parsed), the watchdog records `monitor-error` with `wakeDelivered: false` and exits **0** — a restart could never learn the key, so looping would only burn CPU silently. On every wake, the orchestrator reads both configuration and runtime state, validates the exact current-round artifacts, and reports missing/lost reviewers.
 
-The script holds a single-instance lock for the review. A second babysitter exits 0 without modifying state (never restart-loop). While the sessions CLI is down, the watchdog falls back to artifact-only evaluation (flagged as `sessionQueryFallback: true` in the runtime) so a fully stable set of valid artifacts can still complete the round instead of being mislabeled `monitor-error` after the error window. Runtime writes use PID-unique temporary files plus `os.replace`. Configuration/state read errors use a bounded consecutive-error policy rather than crashing silently.
+The script holds a single-instance lock for the review. A second babysitter exits 0 without modifying state (never restart-loop). While the sessions CLI is down, the watchdog holds the last known status (`sessionQueryFallback: true` in the runtime); a valid artifact unchanged across two consecutive query-failed polls still completes the round as `done` (artifact-aware fallback, r6 M5). Session-query failures never terminalize the round — the deadline is the backstop. A successful but EMPTY listing is genuine absence and feeds the normal absent-session gate. Runtime writes use PID-unique temporary files plus `os.replace`. Configuration/state read errors use a bounded consecutive-error policy rather than crashing silently.
 
 To stop early after independent terminal verification, use `systemctl --user stop "$UNIT"`. Do not kill by an unverified PID.
 

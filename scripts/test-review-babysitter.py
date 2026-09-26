@@ -28,7 +28,8 @@ def write_valid(root: Path, text: str = "NO FINDINGS") -> None:
 
 
 def entry(file="findings.md"):
-    return {"model": "m", "sessionKey": "k", "file": file}
+    # r6 M4: session keys must be real 'agent:<id>:...' keys now.
+    return {"model": "m", "sessionKey": "agent:main:k", "file": file}
 
 
 def run() -> None:
@@ -85,6 +86,21 @@ def run() -> None:
                           "reasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===\n"
                           "Quality summary:\n```text\n===FINDING===\nseverity: [X]\n===END_FINDING===\n```")
         assert bs.artifact_state(root, "findings.md")[0] == "valid"
+        # L4 (r6): an artifact wrapped ENTIRELY in a code fence is still a review.
+        write_valid(root, "```text\n===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\n"
+                          "reasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===\n```")
+        assert bs.artifact_state(root, "findings.md")[0] == "valid"
+        # L5 (r6): trailing whitespace on the markers must not invalidate.
+        write_valid(root, "===FINDING=== \nseverity: High\ntitle: t\nfile: a\nline: 1\n"
+                          "reasoning: r\nfix: f\ntrace: N/A\n ===END_FINDING===")
+        assert bs.artifact_state(root, "findings.md")[0] == "valid"
+        # L1 (r6): placeholders copied verbatim from the SKILL.md template
+        # (not the validator's old strings) are invalid content.
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a.py\nline: 1\n"
+                          "reasoning: <what the code does, why it's wrong, what triggers it>\n"
+                          "fix: <concrete fix suggestion>\n"
+                          "trace: <concrete trace for logic claims, or N/A>\n===END_FINDING===")
+        assert bs.artifact_state(root, "findings.md")[0] == "invalid"
 
         # --- classify -------------------------------------------------------
         write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
@@ -158,10 +174,10 @@ def run() -> None:
             "orchestratorSessionKey": "agent:main:discord:channel:123",
             "models": [entry()],
         }
-        runtime = bs.evaluate_round(config, {}, {"k": session("killed")}, clock_ms=now)
+        runtime = bs.evaluate_round(config, {}, {"agent:main:k": session("killed")}, clock_ms=now)
         assert runtime["round"] == "complete"
         (root / "findings.md").unlink()
-        runtime = bs.evaluate_round(config, {}, {"k": session("killed")}, clock_ms=now)
+        runtime = bs.evaluate_round(config, {}, {"agent:main:k": session("killed")}, clock_ms=now)
         assert runtime["round"] == "complete-with-losses"
         assert runtime["lostModels"] == ["m"]
         runtime = bs.evaluate_round(
@@ -172,19 +188,28 @@ def run() -> None:
         runtime = bs.evaluate_round(config, {}, {}, clock_ms=now)
         assert runtime["models"][0].get("diagnostic")
 
-        # M1 (r5): query_failed holds the last status — never absent, never
-        # promoted to done by the fallback.
-        prev_runtime = bs.evaluate_round(config, {}, {"k": session("running")}, clock_ms=now)
+        # M1 (r5) + M5 (r6): query_failed holds the last status on the first
+        # failed poll; only a valid artifact UNCHANGED across TWO consecutive
+        # query-failed polls terminalizes (artifact-aware fallback).
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
+        prev_runtime = bs.evaluate_round(config, {}, {"agent:main:k": session("running")}, clock_ms=now)
         assert prev_runtime["models"][0]["status"] == "active"
         fb = bs.evaluate_round(config, prev_runtime, {}, clock_ms=now, query_failed=True)
         assert fb["models"][0]["status"] == "active"
         assert fb["models"][0]["sessionAbsent"] is False
         assert fb["models"][0]["diagnostic"] == "session query failed; holding last status"
         assert fb["round"] == "monitoring"
+        fb2 = bs.evaluate_round(config, fb, {}, clock_ms=now, query_failed=True)
+        assert fb2["models"][0]["status"] == "done"
+        assert "stable valid artifact" in fb2["models"][0]["diagnostic"]
+        assert fb2["round"] == "complete"
         # With no prior observation, an unknown status stays non-terminal too.
-        fb2 = bs.evaluate_round(config, {}, {}, clock_ms=now, query_failed=True)
-        assert fb2["models"][0]["status"] == "unknown"
-        assert fb2["round"] == "monitoring"
+        fb3 = bs.evaluate_round(config, {}, {}, clock_ms=now, query_failed=True)
+        assert fb3["models"][0]["status"] == "unknown"
+        assert fb3["round"] == "monitoring"
+        # ...and unknown never promotes, not even after many failed polls.
+        fb4 = bs.evaluate_round(config, fb3, {}, clock_ms=now, query_failed=True)
+        assert fb4["models"][0]["status"] == "unknown"
 
         # --- validate_config -------------------------------------------------
         bad_config = {**config, "models": [{**entry(), "file": "../escape.md"}]}
@@ -197,6 +222,24 @@ def run() -> None:
         try:
             bs.validate_config({**config, "deadlineMs": "2026-09-24T00:00:00Z"})
             raise AssertionError("string deadlineMs accepted")
+        except ValueError:
+            pass
+        # M2 (r6): non-finite deadlines defeat the deadline backstop forever.
+        try:
+            bs.validate_config({**config, "deadlineMs": float("nan")})
+            raise AssertionError("NaN deadlineMs accepted")
+        except ValueError:
+            pass
+        try:
+            bs.validate_config({**config, "deadlineMs": float("inf")})
+            raise AssertionError("inf deadlineMs accepted")
+        except ValueError:
+            pass
+        # M4 (r6): non-'agent:' session keys silently resolved to the wrong
+        # agent; validation must reject them loudly.
+        try:
+            bs.validate_config({**config, "models": [{**entry(), "sessionKey": "subagent:abc"}]})
+            raise AssertionError("non-agent sessionKey accepted")
         except ValueError:
             pass
         # M1 (r4): an empty panel is a config error, never a successful round.
@@ -225,6 +268,22 @@ def run() -> None:
             raise AssertionError("relative reviewDir accepted")
         except ValueError:
             pass
+        # M3 (r6): out-of-bounds env values fall back to the default instead
+        # of reaching an unguarded sleep().
+        saved_env = {k: os.environ.get(k) for k in ("T_NEG", "T_ZERO")}
+        try:
+            os.environ["T_NEG"] = "-1"
+            os.environ["T_ZERO"] = "0"
+            assert bs._env_int("T_MISSING", 7) == 7
+            assert bs._env_int("T_NEG", 300, minimum=1) == 300
+            assert bs._env_int("T_ZERO", 300, minimum=1) == 300
+            assert bs._env_int("T_ZERO", 300) == 0  # unbounded parse stays permissive
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
         # --- wake_orchestrator ----------------------------------------------
         state_path = root / "pending-state.runtime.json"
@@ -351,7 +410,7 @@ def run() -> None:
                     returncode = 0
                     stderr = ""
                     stdout = json.dumps(
-                        {"sessions": [{"key": "k", "status": "running",
+                        {"sessions": [{"key": "agent:main:k", "status": "running",
                                        "lastInteractionAt": bs.now_ms()}]}
                     )
                 return Result()
@@ -426,8 +485,11 @@ def run() -> None:
         saved = json.loads(replay_runtime.read_text())
         assert saved["round"] == "monitor-error" and saved["wakeDelivered"] is False
 
-        # H1 (r5): a STALE terminal runtime from a previous round (fingerprint
-        # mismatch) must NOT kill the new round: the watchdog monitors fresh.
+        # H1 (r5) + H1 (r6): a STALE terminal runtime from a previous round
+        # (fingerprint mismatch) must NOT kill the new round: the watchdog
+        # monitors fresh. The test previously busy-looped forever here (no
+        # terminal condition, no-op sleeper) — the suite hung silently and a
+        # `| tail` pipeline masked the timeout kill as exit 0.
         stale_dir = root / "stalereplay"
         stale_dir.mkdir()
         stale_state = stale_dir / "pending-state.json"
@@ -444,19 +506,102 @@ def run() -> None:
                     returncode = 0
                     stderr = ""
                     stdout = json.dumps(
-                        {"sessions": [{"key": "k", "status": "running",
+                        {"sessions": [{"key": "agent:main:k", "status": "running",
                                        "lastInteractionAt": bs.now_ms()}]}
                     )
                 return Result()
             bs.subprocess.run = stale_run
-            rc = bs.main_impl(stale_state, sleep_fn=lambda s: None)
+            stale_polls = {"n": 0}
+
+            def stale_sleeper(_s):
+                stale_polls["n"] += 1
+                if stale_polls["n"] >= 2:
+                    stale_state.unlink()  # clean stop after 2 monitoring polls
+
+            rc = bs.main_impl(stale_state, sleep_fn=stale_sleeper)
             assert rc == 0
         finally:
             bs.subprocess.run = original_run
         assert stale_calls and stale_calls[0][1] == "sessions", "must monitor, not wake"
         saved = json.loads(stale_runtime.read_text())
-        assert saved["round"] in ("monitoring", "complete")
-        assert "staleTerminalFrom" in saved or saved.get("round") == "monitoring"
+        assert saved["round"] == "stopped-config-gone"
+        assert saved.get("staleTerminalFrom") == "complete"
+
+        # M1 (r6): a NON-terminal runtime from ANOTHER round must not lend its
+        # two-poll stability evidence to the replacement round: with matching
+        # seeded evidence an unrestarted watchdog would classify "done" on the
+        # very first poll of the new round.
+        xdir = root / "crossround"
+        xdir.mkdir()
+        xstate = xdir / "pending-state.json"
+        xcfg = {**h2_config, "reviewDir": str(root),
+                "deadlineMs": bs.now_ms() + 3_600_000}
+        xstate.write_text(json.dumps(xcfg))
+        (root / "findings.md").write_text("NO FINDINGS")
+        st = (root / "findings.md").stat()
+        real_obs = {"size": st.st_size, "mtimeNs": st.st_mtime_ns}
+        xseed = {"round": "monitoring", "configFingerprint": "aaaa0000aaaa0000",
+                 "models": [{"model": "m", "sessionKey": "agent:main:k",
+                             "file": "findings.md", "status": "unknown",
+                             "sessionAbsent": True, "artifactObservation": real_obs}]}
+        bs.runtime_path(xstate).write_text(json.dumps(xseed))
+        xcalls = []
+        try:
+            def x_run(argv, **kwargs):
+                xcalls.append(argv)
+                class Result:
+                    returncode = 0
+                    stderr = ""
+                    stdout = json.dumps({"sessions": []})  # genuine absence (L2)
+                return Result()
+            bs.subprocess.run = x_run
+            xp = {"n": 0}
+
+            def x_sleeper(_s):
+                xp["n"] += 1
+                if xp["n"] >= 1:
+                    xstate.unlink()
+
+            rc = bs.main_impl(xstate, sleep_fn=x_sleeper)
+            assert rc == 0
+        finally:
+            bs.subprocess.run = original_run
+        saved = json.loads(bs.runtime_path(xstate).read_text())
+        m0 = saved["models"][0]
+        # First poll of the new round: absence is NOT yet stable -> unknown.
+        assert m0["status"] == "unknown", m0
+        assert m0["sessionAbsent"] is True
+        assert saved.get("staleObservationsFrom") == "aaaa0000aaaa0000"
+
+        # M7 (r6): repeated session-query failures are NON-terminal — the
+        # round keeps polling (deadline backstop) instead of monitor-error.
+        m7dir = root / "sesserr"
+        m7dir.mkdir()
+        m7state = m7dir / "pending-state.json"
+        m7state.write_text(json.dumps({**h2_config, "reviewDir": str(root)}))
+        (root / "findings.md").unlink()
+        try:
+            def err_sessions(argv, **kwargs):
+                class Result:
+                    returncode = 1
+                    stderr = "cli down"
+                    stdout = ""
+                return Result()
+            bs.subprocess.run = err_sessions
+            m7p = {"n": 0}
+
+            def m7_sleeper(_s):
+                m7p["n"] += 1
+                if m7p["n"] >= 5:
+                    m7state.unlink()
+
+            rc = bs.main_impl(m7state, sleep_fn=m7_sleeper)
+            assert rc == 0
+        finally:
+            bs.subprocess.run = original_run
+        saved = json.loads(bs.runtime_path(m7state).read_text())
+        assert saved["round"] == "stopped-config-gone"
+        assert saved.get("sessionQueryErrors", 0) >= 5
 
         # M5 (r4): a JSON object without a sessions array is an error, not an
         # empty review (silent {} would mark every reviewer absent).
@@ -475,8 +620,8 @@ def run() -> None:
 
         # L2 (r3): duplicate session keys keep the FRESHEST entry, no sentinel.
         dedup_input = [
-            {"key": "k", "status": "killed", "lastInteractionAt": 100},
-            {"key": "k", "status": "done", "lastInteractionAt": 900},
+            {"key": "agent:main:k", "status": "killed", "lastInteractionAt": 100},
+            {"key": "agent:main:k", "status": "done", "lastInteractionAt": 900},
         ]
         try:
             def dup_sessions(argv, **kwargs):
@@ -490,13 +635,15 @@ def run() -> None:
             mapping = bs.query_sessions("main")
         finally:
             bs.subprocess.run = original_run
-        assert mapping["k"]["status"] == "done" and "__duplicate__" not in mapping
-        # M4 (r5): an EMPTY sessions listing is a query failure, not "all
-        # absent" — the watchdog must enter the fallback, never terminalize.
+        assert mapping["agent:main:k"]["status"] == "done" and "__duplicate__" not in mapping
+        # L2 (r6): a successful EMPTY listing is genuine absence — the normal
+        # absent-session two-poll gate classifies it (no fallback flag, no
+        # monitor-error). Two absent polls + stable valid artifact = complete.
         empty_dir = root / "emptyq"
         empty_dir.mkdir()
         empty_state = empty_dir / "pending-state.json"
         empty_state.write_text(json.dumps(h2_config))
+        (root / "findings.md").write_text("NO FINDINGS")
         try:
             def empty_sessions(argv, **kwargs):
                 class Result:
@@ -505,14 +652,22 @@ def run() -> None:
                     stdout = json.dumps({"sessions": []})
                 return Result()
             bs.subprocess.run = empty_sessions
-            rc = bs.main_impl(empty_state, sleep_fn=lambda s: None)
+            ep = {"n": 0}
+
+            def empty_sleeper(_s):
+                ep["n"] += 1
+                if ep["n"] >= 2:
+                    empty_state.unlink()  # clean stop after the round completed
+
+            rc = bs.main_impl(empty_state, sleep_fn=empty_sleeper)
             assert rc == 0
         finally:
             bs.subprocess.run = original_run
         saved = json.loads(bs.runtime_path(empty_state).read_text())
-        assert saved.get("sessionQueryFallback") is True
-        assert saved["models"][0]["sessionAbsent"] is False
-        assert saved["round"] == "monitor-error"
+        assert saved["round"] == "complete", saved.get("round")
+        assert saved["models"][0]["status"] == "done"
+        assert saved["models"][0]["sessionAbsent"] is True
+        assert "sessionQueryFallback" not in saved
         # L4: successful config load clears stale error fields
         runtime = {"configErrors": 1, "lastConfigError": "old"}
         good_state = state_dir / "pending-state.json"
@@ -525,7 +680,7 @@ def run() -> None:
                     stdout = ""
                 if len(argv) > 1 and argv[1] == "sessions":
                     Result.stdout = json.dumps(
-                        {"sessions": [{"key": "k", "status": "done",
+                        {"sessions": [{"key": "agent:main:k", "status": "done",
                                        "lastInteractionAt": bs.now_ms()}]}
                     )
                 return Result()
