@@ -1,61 +1,63 @@
-# Multireview — Round 5 Consolidated Review (rmichelena/multireview @ 806dfb1)
+# Multi-Review — Round 6 (fresh-eyes)
 
-> Panel: 3/3 reviewers — **gpt-5.6-terra**, **glm-5.3**, **deepseek-v4.1-flash** (fresh-eyes, analysis-only, REVIEW.md ignored).
-> 15 raw findings → **14 unique: 1 High · 4 Medium · 9 Low**.
-
-## High
-
-### H1. Stale terminal runtime file makes every later round's babysitter exit without monitoring (1/3 reviewers: deepseek-v4.1-flash)
-`scripts/review-babysitter.py:447` — the r4 restart-continuity feature (seed runtime from disk; if terminal, retry wake and exit) is not keyed to the current round: the skill reuses the same review directory (and thus the same `pending-state.runtime.json`) across rounds, so round N+1's fresh babysitter reads round N's terminal record, re-wakes, and exits. **Reproduced by the reviewer.** Introduced by the r4 M3 fix. **Fix:** persist a config fingerprint (hash of models[].sessionKey + deadlineMs + reviewDir) in the runtime and only treat a terminal record as a restart when the fingerprint matches; otherwise start monitoring fresh.
-
-## Medium
-
-### M1. Session-query fallback treats "unqueryable" as "absent" and can complete a round while a reviewer is still running (2/3 reviewers: gpt-5.6-terra, deepseek-v4.1-flash)
-`scripts/review-babysitter.py:509` — on sessions-query errors the watchdog feeds `sessions={}` into `evaluate_round`; after two failed queries (30s apart) a valid stable artifact marks the reviewer `done` via the absent-session gate — even though it may still be writing. The short 30s retry interval also shrinks the two-poll margin from 300s to 60s. **Fix:** on query failure preserve each model's prior status (do NOT set `sessionAbsent`); require N confirmations at the normal interval, or an atomic-rename artifact protocol, before artifact-only completion.
-
-### M2. Transient/absent pending-state.json on the first poll causes a permanent silent stop with no wake (1/3 reviewers: glm-5.3)
-`scripts/review-babysitter.py:480` — FileNotFoundError on the very first poll maps to `stopped-config-gone` (exit 0, no wake, no restart), indistinguishable from a post-publication cleanup. A write/start ordering hiccup silently kills the watchdog guarantee. **Fix:** treat ENOENT as `stopped-config-gone` only after at least one successful load in this process; before that, count it under the bounded config-error policy (which can still fire the no-key/terminal wake).
-
-### M3. Any non-`running` status — including a missing one — instantly terminates a reviewer as done/lost (1/3 reviewers: glm-5.3)
-`scripts/review-babysitter.py:243` — `status != "running"` is treated as terminal, so an absent `status` field or a future transient value (`queued`, `starting`, `retrying`) flips a possibly-live reviewer to `lost` on the first poll. **Fix:** whitelist known-terminal statuses; unknown/missing → non-terminal `unknown` with the raw status recorded in runtime.
-
-### M4. Sessions query enumerates unbounded history each poll; empty listing accepted as "all absent" (1/3 reviewers: deepseek-v4.1-flash)
-`scripts/review-babysitter.py:138` — `--limit all` over a 462-session store grows toward the 60s timeout, pushing the watchdog into the M1 fallback; and `sessions: []` passes the r4 malformed-envelope guard, feeding "all absent". **Fix:** query only the configured sessionKeys; treat an empty listing (that omits known-live keys) as an error sentinel.
-
-## Low
-
-### L1. Fenced code block quoting the format invalidates the whole artifact (1/3 reviewers: glm-5.3) — `scripts/review-babysitter.py:124`
-A summary that re-quotes the finding template inside a ``` fence trips the stray-marker/pseudo-block heuristics and the entire review is discarded. **Fix:** strip fenced regions before the stray-marker scan.
-
-### L2. Invalid numeric env vars crash at import into an unlogged restart loop (1/3 reviewers: glm-5.3) — `scripts/review-babysitter.py:17`
-`int()` on `POLL_INTERVAL`/`STALL_THRESHOLD` at import dies before any error policy exists → deterministic 30s systemd loop. **Fix:** defensive parse with fallback/warning, or validate in `main()` and exit 0 like other invocation errors.
-
-### L3. Agent-id fallback silently scopes the query to the wrong agent (1/3 reviewers: glm-5.3) — `scripts/review-babysitter.py:78`
-Non-`agent:`-shaped orchestrator keys fall back to `AGENT_ID` with no signal; reviewers under another agent become permanently `unknown`. **Fix:** derive agent ids from each model entry's own sessionKey, or record `agentIdFallback: true` in runtime.
-
-### L4. Placeholder detector rejects legitimate angle-bracket values and drops the whole reviewer (1/3 reviewers: deepseek-v4.1-flash) — `scripts/review-babysitter.py:23`
-`^<.*>$` rejects a genuine `title: <script>` finding; one invalid block invalidates the file → reviewer `lost`. **Fix:** match the exact template placeholder strings instead of all `<...>`.
-
-### L5. Stalled gate needs three equal transcript samples, docs say two (1/3 reviewers: deepseek-v4.1-flash) — `scripts/review-babysitter.py:263`
-`prev_transcript == transcript` plus `previous.stale` (itself transcript-derived) sums to three polls. Safe but slower than documented. **Fix:** relax the gate or update SKILL.md.
-
-### L6. SKILL.md undercounts exit-0 paths and mislabels the wake text placeholder (1/3 reviewers: deepseek-v4.1-flash) — `SKILL.md:538`
-Docs say "two deliberate exit-0 paths"; there are five. Wake template shows `<round>` but the code substitutes the terminal state name. **Fix:** enumerate all paths; fix the wake-text doc.
-
-### L7. reviewDir not required absolute — resolves against systemd's CWD (1/3 reviewers: deepseek-v4.1-flash) — `scripts/review-babysitter.py:384`
-A relative reviewDir silently reads the wrong tree under `systemd-run` (CWD=$HOME) → spurious losses. **Fix:** reject non-absolute reviewDir in validate_config.
-
-### L8. Wake retry uses non-injectable `time.sleep(5)`, slowing the suite ~30-40s per run (1/3 reviewers: deepseek-v4.1-flash) — `scripts/review-babysitter.py:366`
-**Fix:** parameterize the retry delay; tests pass 0.
-
-### L9. Comment claims error counters survive restart; only model observations are seeded (1/3 reviewers: deepseek-v4.1-flash) — `scripts/review-babysitter.py:440`
-**Fix:** correct the comment.
+**Panel (3/3 responded, no fallbacks):** gpt-5.6-terra · glm-5.3 · deepseek-v4.1-flash
+**Target:** `rmichelena/multireview` @ `b1d9afee78e457b66cecfed8b72b7beb4e7de4f1` (round-5 fixes)
+**Raw findings:** 16 (Terra 4 · GLM 5 · DeepSeek 7) → **13 unique: 1 High · 7 Medium · 5 Low**
 
 ---
 
-## Nota de proceso
-- Snapshot: commit `806dfb1` (post-fix ronda 4), revisión fresh-eyes sin acceso a reviews previas.
-- Consolidación por este orquestador (acuerdo del orquestador no suma revisores).
-- Archivos brutos: `findings-r5-terra.md` (1), `findings-r5-glm.md` (5), `findings-r5-deepseek.md` (9).
-- H1 y M1 fueron **reproducidos empíricamente** por el revisor (probes contra el código real).
-- El H1 es una consecuencia no deseada del fix M3 de ronda 4 (continuidad de runtime) — hallazgo legítimo de regresión arquitectural, no de implementación.
+## Fix verification (R5 findings)
+
+| R5 | Verdict |
+|---|---|
+| H1 stale terminal runtime kills later rounds | **FIXED** — configFingerprint gates the terminal-replay path; reproduced mismatch now monitors fresh |
+| M1 unqueryable ≠ absent | **FIXED** — `query_failed` holds last status (but left doc drift: see M6) |
+| M2 first-poll ENOENT | **FIXED** — `saw_config` gate; never-seen config is a bounded config error |
+| M3 status whitelist | **FIXED** — `KNOWN_TERMINAL_STATUSES` + `unknown` fallback (doc drift: see M6) |
+| M4 empty listing / agent derivation | **FIXED** — empty listing is a query failure; per-entry `agent_id_for` (over-broad side effect: see L2/M7) |
+| L1 fenced template in summary | **FIXED** — fence stripping (new edge case: see L5) |
+| L2 env int crash | **FIXED** — `_env_int` defensive parse (bounds gap: see M3) |
+| L3 silent wrong-agent fallback | **PARTIALLY FIXED** — ids derived per entry, but non-`agent:` keys still fall back silently (see M4) |
+| L4 placeholder detector | **PARTIALLY FIXED** — exact matching works but the placeholder strings don't match SKILL.md (see L1) |
+| L5 stall gate 2 polls | **FIXED** |
+| L6 SKILL.md exit-0 paths | **PARTIALLY FIXED** — still undercounted (see L3) |
+| L7 reviewDir absolute | **FIXED** |
+| L8 injectable wake sleep | **FIXED** |
+| L9 stale comment | **FIXED** |
+
+⚠️ **Process finding (orchestrator):** the round-5 fix commit was announced with "regression suite green (exit 0)". That verification was **invalid**: the suite hangs at the stale-replay case (H1 below) and the orchestrator's `| tail` pipeline masked the 150s timeout kill as exit 0. Both r6 reviewers independently reproduced the hang.
+
+---
+
+## Fresh-eyes review — Round 6
+
+### High
+
+- **H1. Regression test suite hangs forever at the stale-replay case (2/3 reviewers: gpt-5.6-terra, glm-5.3)** — `test-review-babysitter.py:452`. `main_impl(stale_state, sleep_fn=lambda s: None)` with a perpetually-running fresh session, far-future deadline, and a no-op sleeper: the monitoring loop has no terminal condition. Busy-loops until the 1h deadline, then `round == "deadline"` fails the assertion. Verified by execution by both reviewers; the hang also silently disabled the r5 regression gate (see process finding above). **Fix:** make the sleeper unlink the config after N polls (as the h2 test does) or use an expired deadline and assert the intended one-poll behavior.
+
+### Medium
+
+- **M1. Non-terminal seeded runtime inherits two-poll evidence across config replacement (1/3 reviewers: gpt-5.6-terra)** — `review-babysitter.py:535`. The fingerprint is only consulted when the seeded runtime is *terminal*; a non-terminal seeded runtime keeps its models even when the new config has a different fingerprint. Replacing `pending-state.json` for a new round that reuses a sessionKey can satisfy the absent/stalled two-poll gates on the first poll of the new round with the previous round's observations — publishing a stale artifact as the new round's completion. **Fix:** compare fingerprints for non-terminal seeds too; on mismatch reset models and stability observations.
+- **M2. NaN/Infinity deadlineMs pass validation and disable the deadline backstop (1/3 reviewers: gpt-5.6-terra)** — `review-babysitter.py:436`. `isinstance(deadlineMs, (int, float))` accepts NaN/inf (json.loads accepts them); `current >= NaN` is always False so the round never terminates by deadline. **Fix:** `math.isfinite` check + regression cases.
+- **M3. Negative/zero poll intervals bypass defensive env parsing (1/3 reviewers: gpt-5.6-terra)** — `review-babysitter.py:27`. `_env_int` rejects malformed text but accepts `-1` → `time.sleep(-1)` raises outside the guarded loop → restart loop under `Restart=on-failure`; `0` spins the poll loop at full rate; negative stall threshold marks everything stale. **Fix:** validate operational bounds, fall back to defaults.
+- **M4. `agent_id_for` silently falls back to the default agent for non-`agent:` keys (1/3 reviewers: glm-5.3)** — `review-babysitter.py:99`. Keys of other shapes (e.g. `subagent:<uuid>`) query the wrong agent's listing; the reviewer is never found and sits at `unknown` until deadline, with no diagnostic of the shape mismatch (contradicts the r5 L3 "no silent fallback" comment). **Fix:** validate key shape at config load or record `unresolvedSessionKeys`.
+- **M5. SKILL.md documents the artifact-only fallback that r5 M1 removed (1/3 reviewers: deepseek-v4.1-flash)** — `SKILL.md:578` / `review-babysitter.py:342`. The `query_failed` branch holds the last status and never reads artifacts, so a stable valid artifact cannot terminalize during a sessions outage — but SKILL.md and the inline comment still advertise exactly that. Doc/comment drift vs code. **Fix:** restore an artifact-aware fallback or correct the docs to say the fallback only holds status.
+- **M6. SKILL.md `lost`/`unknown` contract contradicts the r5 M3 whitelist (2/3 reviewers: glm-5.3, deepseek-v4.1-flash)** — `SKILL.md:547`. Docs say null/any future non-running status is `lost`; code returns non-terminal `unknown` for null/unrecognized statuses. Misleads operators reading runtime state during incidents. **Fix:** update the state contract bullets to the whitelist semantics.
+- **M7. Unbounded `sessions --limit all` + 3-strike terminal policy can abort a healthy round (1/3 reviewers: deepseek-v4.1-flash)** — `review-babysitter.py:178`. A growing session store can push the listing past the 60s timeout; three consecutive failures (~90s apart) terminalize as `monitor-error` and wake while reviewers are still healthy — and the (advertised but missing, M5) artifact fallback can't rescue it. **Fix:** scope the query to configured sessionKeys and/or make repeated query failures non-terminal with the deadline as backstop.
+
+### Low
+
+- **L1. TEMPLATE_PLACEHOLDERS strings don't match the canonical SKILL.md template (2/3 reviewers: glm-5.3, deepseek-v4.1-flash)** — `review-babysitter.py:37`. The set has `<concrete fix>` / `<what the code does, why it is wrong, trigger>` but templates emit `<concrete fix suggestion>` / `...what triggers it`; parroted reasoning/fix/trace placeholders pass validation. **Fix:** sync strings with SKILL.md or normalize `<...>` free-text fields; add a verbatim-template regression test.
+- **L2. Legitimately empty sessions listing is an error forever (1/3 reviewers: glm-5.3)** — `review-babysitter.py:629`. All sessions pruned → `{"sessions": []}` → permanent error path → `monitor-error` despite stable valid artifacts, while the absent-session gate would have completed correctly. **Fix:** distinguish rc==0 empty listing (genuine absence) from shape/CLI failures.
+- **L3. "Two deliberate exit-0 paths" undercounts (1/3 reviewers: deepseek-v4.1-flash)** — `SKILL.md:538`. Code has ≥5: usage error, lock contention, terminal-restart-no-key, no-key monitor-error, stopped-config-gone, successful wake. **Fix:** enumerate them.
+- **L4. Fence stripping invalidates a fully-fenced findings file (1/3 reviewers: deepseek-v4.1-flash)** — `review-babysitter.py:157`. A reviewer wrapping its entire well-formed output in a code fence gets classified `lost`. **Fix:** strip fences only for the stray-marker scan, or preserve regions containing complete blocks.
+- **L5. Trailing space on the opening marker discards a complete artifact (1/3 reviewers: deepseek-v4.1-flash)** — `review-babysitter.py:33`. `===FINDING=== ` (trailing space) doesn't match `FINDING_RE` but matches `MARKER_LINE_RE` → whole artifact invalid; closing marker is asymmetrically tolerant. **Fix:** allow optional trailing whitespace on both markers.
+
+---
+
+## Recommended fix order
+
+1. **H1** — the suite is the safety net; it must run to completion (and re-verify with `timeout` + direct exit code, no pipes).
+2. **M1** (round-identity for non-terminal seeds — the fingerprint's stated purpose), **M5/M6** (doc truthfulness), **M7+L2** (query robustness).
+3. **M2, M3, M4** (validation bounds and diagnostics).
+4. Lows (parser tolerance + doc counts).
