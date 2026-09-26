@@ -74,14 +74,30 @@ def run() -> None:
                           "line: <line_number>\nreasoning: <what the code does>\n"
                           "fix: <concrete fix>\ntrace: <concrete trace or N/A>\n===END_FINDING===")
         assert bs.artifact_state(root, "findings.md")[0] == "invalid"
+        # L4 (r5): the detector matches exact template placeholders only, not
+        # every <...> value — a genuine `title: <script>` finding is content.
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: <script>\nfile: a\nline: 1\n"
+                          "reasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
+        assert bs.artifact_state(root, "findings.md")[0] == "valid"
+        # L1 (r5): a summary quoting the template inside a fenced code block
+        # is legitimate prose — fences are stripped before marker scanning.
+        write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\n"
+                          "reasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===\n"
+                          "Quality summary:\n```text\n===FINDING===\nseverity: [X]\n===END_FINDING===\n```")
+        assert bs.artifact_state(root, "findings.md")[0] == "valid"
 
         # --- classify -------------------------------------------------------
         write_valid(root, "===FINDING===\nseverity: High\ntitle: t\nfile: a\nline: 1\nreasoning: r\nfix: f\ntrace: N/A\n===END_FINDING===")
-        for status in ("done", "failed", "killed", "aborted", None):
+        for status in ("done", "failed", "killed", "aborted"):
             assert bs.classify(session(status), root, entry(), clock_ms=now)[0] == "done"
         (root / "findings.md").unlink()
-        for status in ("done", "failed", "killed", "aborted", None):
+        for status in ("done", "failed", "killed", "aborted"):
             assert bs.classify(session(status), root, entry(), clock_ms=now)[0] == "lost"
+        # M3 (r5): unknown/missing status is NOT evidence of exit.
+        write_valid(root)
+        for status in (None, "queued", "starting"):
+            assert bs.classify(session(status), root, entry(), clock_ms=now)[0] == "unknown"
+        (root / "findings.md").unlink()
 
         # M2 (r4): absent session needs TWO consecutive absent polls plus a
         # stable artifact before "done".
@@ -156,6 +172,20 @@ def run() -> None:
         runtime = bs.evaluate_round(config, {}, {}, clock_ms=now)
         assert runtime["models"][0].get("diagnostic")
 
+        # M1 (r5): query_failed holds the last status — never absent, never
+        # promoted to done by the fallback.
+        prev_runtime = bs.evaluate_round(config, {}, {"k": session("running")}, clock_ms=now)
+        assert prev_runtime["models"][0]["status"] == "active"
+        fb = bs.evaluate_round(config, prev_runtime, {}, clock_ms=now, query_failed=True)
+        assert fb["models"][0]["status"] == "active"
+        assert fb["models"][0]["sessionAbsent"] is False
+        assert fb["models"][0]["diagnostic"] == "session query failed; holding last status"
+        assert fb["round"] == "monitoring"
+        # With no prior observation, an unknown status stays non-terminal too.
+        fb2 = bs.evaluate_round(config, {}, {}, clock_ms=now, query_failed=True)
+        assert fb2["models"][0]["status"] == "unknown"
+        assert fb2["round"] == "monitoring"
+
         # --- validate_config -------------------------------------------------
         bad_config = {**config, "models": [{**entry(), "file": "../escape.md"}]}
         try:
@@ -188,6 +218,13 @@ def run() -> None:
             raise AssertionError("duplicate sessionKey accepted")
         except ValueError:
             pass
+        # L7 (r5): reviewDir must be absolute — under systemd-run the CWD is
+        # $HOME and a relative path silently reads the wrong tree.
+        try:
+            bs.validate_config({**config, "reviewDir": "relative/review"})
+            raise AssertionError("relative reviewDir accepted")
+        except ValueError:
+            pass
 
         # --- wake_orchestrator ----------------------------------------------
         state_path = root / "pending-state.runtime.json"
@@ -202,7 +239,8 @@ def run() -> None:
                 return Result()
             bs.subprocess.run = fake_run
             runtime = {"round": "complete"}
-            assert bs.wake_orchestrator(config, state_path, runtime)
+            assert bs.wake_orchestrator(config, state_path, runtime,
+                                        sleep_fn=lambda s: None)
         finally:
             bs.subprocess.run = original_run
         assert "--session-key" in calls[0]
@@ -217,14 +255,15 @@ def run() -> None:
                 return Result()
             bs.subprocess.run = failing_run
             runtime = {"round": "complete"}
-            assert bs.wake_orchestrator(config, state_path, runtime) is False
+            assert bs.wake_orchestrator(config, state_path, runtime,
+                                        sleep_fn=lambda s: None) is False
         finally:
             bs.subprocess.run = original_run
         saved = json.loads(state_path.read_text())
         assert saved["wakeDelivered"] is False and "boom" in saved["wakeError"]
 
-        # H1: config-error path wakes and never silent-restarts forever;
-        # missing config file is a clean stop.
+        # H1: missing config that was NEVER seen is now a bounded config-error
+        # path (r5 M2): 3 errors -> monitor-error with no key, exit 0.
         state_dir = root / "h1"
         state_dir.mkdir()
         state_config = state_dir / "pending-state.json"
@@ -234,10 +273,13 @@ def run() -> None:
                 raise AssertionError("openclaw should not be called for missing config")
             bs.subprocess.run = never_event
             rc = bs.main_impl(state_config, sleep_fn=lambda s: None)
-            assert rc == 0, f"missing config should be clean stop, got {rc}"
+            assert rc == 0, f"no-key monitor-error must not restart-loop, got {rc}"
         finally:
             bs.subprocess.run = original_run
-        assert json.loads(runtime_path.read_text())["round"] == "stopped-config-gone"
+        saved = json.loads(runtime_path.read_text())
+        assert saved["round"] == "monitor-error"
+        assert saved.get("configErrors", 0) >= 3
+        assert saved["wakeDelivered"] is False
 
         # H1b/M4 (r3): malformed config x3 -> monitor-error; with no wake key
         # available the process exits 0 so systemd does NOT restart-loop.
@@ -355,15 +397,18 @@ def run() -> None:
             rc = bs.main_impl(lock_state, sleep_fn=lambda s: None)
             assert rc == 0, f"lock contention must exit 0, got {rc}"
 
-        # M3 (r4): restart with a persisted TERMINAL runtime retries the wake
-        # instead of re-monitoring and erasing the record.
+        # M3 (r4) + H1 (r5): restart with a persisted TERMINAL runtime of the
+        # SAME round (fingerprint match) retries the wake; a stale terminal
+        # runtime from a PREVIOUS round must monitor fresh instead.
         replay_dir = root / "replay"
         replay_dir.mkdir()
         replay_state = replay_dir / "pending-state.json"
-        replay_state.write_text(json.dumps(h2_config))
+        replay_config = {**h2_config, "reviewDir": str(root)}
+        replay_state.write_text(json.dumps(replay_config))
         replay_runtime = bs.runtime_path(replay_state)
         replay_runtime.write_text(json.dumps(
-            {"round": "monitor-error", "wakeError": "gateway down"}))
+            {"round": "monitor-error", "wakeError": "gateway down",
+             "configFingerprint": bs.config_fingerprint(replay_config)}))
         replay_calls = []
         try:
             def replay_run(argv, **kwargs):
@@ -380,6 +425,38 @@ def run() -> None:
         assert replay_calls and replay_calls[0][1] == "system", "wake must be retried, not monitored"
         saved = json.loads(replay_runtime.read_text())
         assert saved["round"] == "monitor-error" and saved["wakeDelivered"] is False
+
+        # H1 (r5): a STALE terminal runtime from a previous round (fingerprint
+        # mismatch) must NOT kill the new round: the watchdog monitors fresh.
+        stale_dir = root / "stalereplay"
+        stale_dir.mkdir()
+        stale_state = stale_dir / "pending-state.json"
+        stale_state.write_text(json.dumps(h2_config))
+        stale_runtime = bs.runtime_path(stale_state)
+        stale_runtime.write_text(json.dumps(
+            {"round": "complete", "wakeDelivered": True,
+             "configFingerprint": "deadbeef00000000"}))
+        stale_calls = []
+        try:
+            def stale_run(argv, **kwargs):
+                stale_calls.append(argv)
+                class Result:
+                    returncode = 0
+                    stderr = ""
+                    stdout = json.dumps(
+                        {"sessions": [{"key": "k", "status": "running",
+                                       "lastInteractionAt": bs.now_ms()}]}
+                    )
+                return Result()
+            bs.subprocess.run = stale_run
+            rc = bs.main_impl(stale_state, sleep_fn=lambda s: None)
+            assert rc == 0
+        finally:
+            bs.subprocess.run = original_run
+        assert stale_calls and stale_calls[0][1] == "sessions", "must monitor, not wake"
+        saved = json.loads(stale_runtime.read_text())
+        assert saved["round"] in ("monitoring", "complete")
+        assert "staleTerminalFrom" in saved or saved.get("round") == "monitoring"
 
         # M5 (r4): a JSON object without a sessions array is an error, not an
         # empty review (silent {} would mark every reviewer absent).
@@ -414,6 +491,28 @@ def run() -> None:
         finally:
             bs.subprocess.run = original_run
         assert mapping["k"]["status"] == "done" and "__duplicate__" not in mapping
+        # M4 (r5): an EMPTY sessions listing is a query failure, not "all
+        # absent" — the watchdog must enter the fallback, never terminalize.
+        empty_dir = root / "emptyq"
+        empty_dir.mkdir()
+        empty_state = empty_dir / "pending-state.json"
+        empty_state.write_text(json.dumps(h2_config))
+        try:
+            def empty_sessions(argv, **kwargs):
+                class Result:
+                    returncode = 0
+                    stderr = ""
+                    stdout = json.dumps({"sessions": []})
+                return Result()
+            bs.subprocess.run = empty_sessions
+            rc = bs.main_impl(empty_state, sleep_fn=lambda s: None)
+            assert rc == 0
+        finally:
+            bs.subprocess.run = original_run
+        saved = json.loads(bs.runtime_path(empty_state).read_text())
+        assert saved.get("sessionQueryFallback") is True
+        assert saved["models"][0]["sessionAbsent"] is False
+        assert saved["round"] == "monitor-error"
         # L4: successful config load clears stale error fields
         runtime = {"configErrors": 1, "lastConfigError": "old"}
         good_state = state_dir / "pending-state.json"
